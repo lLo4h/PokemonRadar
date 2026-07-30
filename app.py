@@ -1,5 +1,6 @@
 import argparse
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 import requests
@@ -203,12 +204,9 @@ def run_all_prestashop_once() -> None:
     print(f"\n[PRESTASHOP] Fertig: {succeeded} erfolgreich, {failed} fehlgeschlagen.")
 
 
-def run_scan_all_once() -> dict[str, int]:
-    """Scannt alle aktuell funktionierenden Shops nacheinander.
-
-    Ein Fehler bei einem Shop stoppt die übrigen Shops nicht.
-    """
-    jobs = [
+def build_scan_jobs() -> list[dict[str, object]]:
+    """Erstellt die Liste aller konfigurierten Shop-Scans."""
+    jobs: list[dict[str, object]] = [
         {
             "name": WOG_SHOP_NAME,
             "scanner": scan_wog,
@@ -247,33 +245,61 @@ def run_scan_all_once() -> dict[str, int]:
             }
         )
 
+    return jobs
+
+
+def run_scan_all_once(max_workers: int = 5) -> dict[str, int]:
+    """Lädt mehrere Shops parallel und verarbeitet Ergebnisse kontrolliert.
+
+    Nur die Netzwerkabfragen laufen gleichzeitig. Datenbankzugriffe und
+    Discord-Meldungen werden danach im Hauptthread verarbeitet. Dadurch
+    bleibt SQLite zuverlässig, während langsame Shop-Antworten nicht mehr
+    alle anderen Shops blockieren.
+    """
+    jobs = build_scan_jobs()
+    workers = max(1, min(int(max_workers), len(jobs)))
+
     print(f"[ALLE SHOPS] Starte {len(jobs)} konfigurierte Shops.")
+    print(f"[PARALLEL] Bis zu {workers} Shops werden gleichzeitig geladen.")
+
     succeeded = 0
     failed = 0
     total_products = 0
     total_notifications = 0
     failed_names: list[str] = []
+    started = time.monotonic()
 
-    for job in jobs:
-        name = str(job["name"])
-        print(f"\n[{name}] Scan startet …")
-        try:
-            products = job["scanner"]()
-            result = process_products(name, products)
-            total_products += result["products"]
-            total_notifications += result["notifications"]
-            succeeded += 1
-        except Exception as error:
-            failed += 1
-            failed_names.append(name)
-            print(f"[{name}] FEHLER: {type(error).__name__}: {error}")
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="shop-scan") as executor:
+        future_to_name = {}
+        for job in jobs:
+            name = str(job["name"])
+            scanner = job["scanner"]
+            print(f"[{name}] Scan eingeplant …")
+            future = executor.submit(scanner)
+            future_to_name[future] = name
 
+        for future in as_completed(future_to_name):
+            name = future_to_name[future]
+            print(f"\n[{name}] Download abgeschlossen – Produkte werden verarbeitet …")
+            try:
+                products = future.result()
+                result = process_products(name, products)
+                total_products += result["products"]
+                total_notifications += result["notifications"]
+                succeeded += 1
+            except Exception as error:
+                failed += 1
+                failed_names.append(name)
+                print(f"[{name}] FEHLER: {type(error).__name__}: {error}")
+
+    duration = time.monotonic() - started
     print("\n" + "=" * 58)
     print("[GESAMTÜBERSICHT]")
     print(f"Shops erfolgreich: {succeeded}")
     print(f"Shops fehlgeschlagen: {failed}")
     print(f"Produkte geprüft: {total_products}")
     print(f"Discord-Meldungen: {total_notifications}")
+    print(f"Scan-Dauer: {duration:.1f} Sekunden")
     if failed_names:
         print(f"Fehlerhafte Shops: {', '.join(failed_names)}")
     print("=" * 58)
@@ -289,7 +315,7 @@ def timestamp() -> str:
     return datetime.now().strftime("%d.%m.%Y %H:%M:%S")
 
 
-def run_forever(interval_seconds: int) -> None:
+def run_forever(interval_seconds: int, max_workers: int = 5) -> None:
     interval_seconds = max(60, int(interval_seconds))
     round_number = 0
     print(f"[{timestamp()}] [DAUERBETRIEB] Pokémon Radar wurde gestartet.")
@@ -302,7 +328,7 @@ def run_forever(interval_seconds: int) -> None:
             started = time.monotonic()
             print("\n" + "#" * 58)
             print(f"[{timestamp()}] [RUNDE {round_number}] Scan beginnt.")
-            run_scan_all_once()
+            run_scan_all_once(max_workers)
             duration = int(time.monotonic() - started)
             next_start = datetime.now() + timedelta(seconds=interval_seconds)
             print(f"[{timestamp()}] [RUNDE {round_number}] Dauer: {duration} Sekunden.")
@@ -327,6 +353,7 @@ def main() -> int:
     parser.add_argument("--scan-woocommerce-shops-once", action="store_true")
     parser.add_argument("--scan-prestashop-shops-once", action="store_true")
     parser.add_argument("--scan-all-once", action="store_true")
+    parser.add_argument("--workers", type=int, default=5, help="Maximal gleichzeitig geladene Shops (Standard: 5)")
     parser.add_argument("--run", action="store_true", help="Alle Shops dauerhaft in einem Intervall scannen")
     parser.add_argument("--interval", type=int, default=SCAN_INTERVAL_SECONDS, help="Wartezeit zwischen Scanrunden in Sekunden (mindestens 60)")
     parser.add_argument("--shop-name", default="Shopify Shop")
@@ -358,11 +385,11 @@ def main() -> int:
         elif args.scan_prestashop_shops_once:
             run_all_prestashop_once()
         elif args.scan_all_once:
-            run_scan_all_once()
+            run_scan_all_once(args.workers)
         elif args.run:
             if args.interval < 60:
                 parser.error("Das Intervall muss mindestens 60 Sekunden betragen.")
-            run_forever(args.interval)
+            run_forever(args.interval, args.workers)
         elif args.scan_shopify_once:
             if not args.shop_url:
                 parser.error("Für --scan-shopify-once fehlt --shop-url.")
