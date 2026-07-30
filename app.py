@@ -2,6 +2,7 @@ import argparse
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
 import requests
 
@@ -337,6 +338,68 @@ def run_shop_detection(url: str) -> None:
     print("=" * 58)
 
 
+
+def suggested_shop_name(url: str) -> str:
+    """Erstellt aus einer URL einen gut lesbaren vorläufigen Shopnamen."""
+    hostname = (urlparse(url).hostname or "Neuer Shop").lower()
+    if hostname.startswith("www."):
+        hostname = hostname[4:]
+    base = hostname.split(".")[0].replace("-", " ").replace("_", " ")
+    return base.title() or "Neuer Shop"
+
+
+def run_add_shop_preview(url: str) -> None:
+    """Erkennt einen Shop und testet den passenden Scanner, speichert aber noch nichts."""
+    print("=" * 58)
+    print("[SHOP-IMPORTER] Neuer Shop wird geprüft …")
+    print(f"Eingegebene URL: {url}")
+
+    detection = detect_shop_type(url)
+    print(f"Erreichte URL:   {detection.final_url}")
+    print("-" * 58)
+
+    if detection.shop_type == "unknown":
+        print("[STOP] Shopsystem konnte nicht sicher erkannt werden.")
+        print("       Der Shop wurde nicht getestet und nicht gespeichert.")
+        print("=" * 58)
+        return
+
+    labels = {
+        "shopify": "Shopify",
+        "woocommerce": "WooCommerce",
+        "prestashop": "PrestaShop",
+    }
+    shop_name = suggested_shop_name(detection.final_url)
+
+    print(f"[OK] Shopsystem erkannt: {labels[detection.shop_type]}")
+    print(f"Vorläufiger Shopname:    {shop_name}")
+    print(f"Empfohlener Scanner:     {scanner_name(detection.shop_type)}")
+    print("-" * 58)
+    print("[TESTSCAN] Pokémon-Produkte werden gesucht …")
+
+    started = time.monotonic()
+    if detection.shop_type == "shopify":
+        products = scan_shopify(shop_name, detection.final_url)
+    elif detection.shop_type == "woocommerce":
+        products = scan_woocommerce(shop_name, detection.final_url, max_pages=10)
+    else:
+        products = scan_prestashop(shop_name, detection.final_url, max_pages=70)
+    duration = time.monotonic() - started
+
+    available = sum(product.status == "available" for product in products)
+    unavailable = sum(product.status == "unavailable" for product in products)
+    unknown = sum(product.status == "unknown" for product in products)
+
+    if products:
+        print(f"[OK] Testscan erfolgreich: {len(products)} Pokémon-TCG-Produkte gefunden.")
+        print(f"Status: {available} verfügbar, {unavailable} nicht verfügbar, {unknown} unbekannt.")
+        print(f"Dauer:  {duration:.1f} Sekunden")
+        print("[INFO] Der Shop wurde in diesem Schritt noch NICHT gespeichert.")
+    else:
+        print("[WARNUNG] Scanner lief, aber es wurden keine Pokémon-TCG-Produkte gefunden.")
+        print("          Der Shop wurde nicht gespeichert.")
+    print("=" * 58)
+
 def timestamp() -> str:
     return datetime.now().strftime("%d.%m.%Y %H:%M:%S")
 
@@ -380,6 +443,7 @@ def main() -> int:
     parser.add_argument("--scan-prestashop-shops-once", action="store_true")
     parser.add_argument("--scan-all-once", action="store_true")
     parser.add_argument("--detect-shop", metavar="URL", help="Shopsystem einer URL erkennen")
+    parser.add_argument("--add-shop", metavar="URL", help="Shop erkennen und Scanner testweise ausführen (noch ohne Speichern)")
     parser.add_argument("--workers", type=int, default=5, help="Maximal gleichzeitig geladene Shops (Standard: 5)")
     parser.add_argument("--run", action="store_true", help="Alle Shops dauerhaft in einem Intervall scannen")
     parser.add_argument("--interval", type=int, default=SCAN_INTERVAL_SECONDS, help="Wartezeit zwischen Scanrunden in Sekunden (mindestens 60)")
@@ -391,7 +455,9 @@ def main() -> int:
     print("[OK] Datenbank wurde vorbereitet.")
 
     try:
-        if args.detect_shop:
+        if args.add_shop:
+            run_add_shop_preview(args.add_shop)
+        elif args.detect_shop:
             run_shop_detection(args.detect_shop)
         elif args.test_webhook:
             send_test_message(); print("[OK] Testnachricht wurde an Discord gesendet.")
@@ -426,6 +492,7 @@ def main() -> int:
         else:
             print("[INFO] PokemonRadar ist bereit.")
             print("[INFO] Shop erkennen:    python app.py --detect-shop https://shop.ch")
+            print("[INFO] Shop testen:      python app.py --add-shop https://shop.ch")
             print("[INFO] Einmaliger Scan: python app.py --scan-all-once")
             print("[INFO] Dauerbetrieb:    python app.py --run")
     except WebhookError as error:
