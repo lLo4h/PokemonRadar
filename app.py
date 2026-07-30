@@ -1,5 +1,8 @@
 import argparse
+import json
+import re
 import time
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
@@ -348,8 +351,71 @@ def suggested_shop_name(url: str) -> str:
     return base.title() or "Neuer Shop"
 
 
-def run_add_shop_preview(url: str) -> None:
-    """Erkennt einen Shop und testet den passenden Scanner, speichert aber noch nichts."""
+def normalized_hostname(url: str) -> str:
+    """Vereinheitlicht eine Shop-Domain für die Duplikatprüfung."""
+    hostname = (urlparse(url).hostname or "").lower().strip()
+    if hostname.startswith("www."):
+        hostname = hostname[4:]
+    return hostname
+
+
+def find_configured_shop(url: str) -> dict[str, str] | None:
+    """Sucht einen bereits konfigurierten Shop mit derselben Domain."""
+    wanted_host = normalized_hostname(url)
+    for shop_type, shops in (
+        ("shopify", SHOPIFY_SHOPS),
+        ("woocommerce", WOOCOMMERCE_SHOPS),
+        ("prestashop", PRESTASHOP_SHOPS),
+    ):
+        for shop in shops:
+            if normalized_hostname(shop["url"]) == wanted_host:
+                return {
+                    "name": shop["name"],
+                    "url": shop["url"],
+                    "shop_type": shop_type,
+                }
+    return None
+
+
+def save_shop_to_config(shop_type: str, shop_name: str, shop_url: str) -> None:
+    """Fügt einen geprüften Shop sicher in shops_config.py ein."""
+    variable_names = {
+        "shopify": "SHOPIFY_SHOPS",
+        "woocommerce": "WOOCOMMERCE_SHOPS",
+        "prestashop": "PRESTASHOP_SHOPS",
+    }
+    variable_name = variable_names[shop_type]
+    config_path = Path(__file__).with_name("shops_config.py")
+    content = config_path.read_text(encoding="utf-8")
+
+    entry: dict[str, object] = {"name": shop_name, "url": shop_url}
+    if shop_type == "woocommerce":
+        entry["max_pages"] = 10
+    elif shop_type == "prestashop":
+        entry["max_pages"] = 70
+
+    pattern = re.compile(
+        rf"(?ms)^(?P<head>{variable_name}\s*=\s*\[)(?P<body>.*?)(?P<tail>^\])"
+    )
+    match = pattern.search(content)
+    if not match:
+        raise RuntimeError(f"Bereich {variable_name} wurde in shops_config.py nicht gefunden.")
+
+    entry_text = "    " + json.dumps(entry, ensure_ascii=False) + ",\n"
+    body = match.group("body")
+    if body and not body.endswith("\n"):
+        body += "\n"
+
+    updated_block = match.group("head") + body + entry_text + match.group("tail")
+    updated_content = content[: match.start()] + updated_block + content[match.end() :]
+
+    backup_path = config_path.with_suffix(".py.bak")
+    backup_path.write_text(content, encoding="utf-8")
+    config_path.write_text(updated_content, encoding="utf-8")
+
+
+def run_add_shop(url: str) -> None:
+    """Erkennt, testet und speichert einen Shop nach Bestätigung."""
     print("=" * 58)
     print("[SHOP-IMPORTER] Neuer Shop wird geprüft …")
     print(f"Eingegebene URL: {url}")
@@ -390,14 +456,36 @@ def run_add_shop_preview(url: str) -> None:
     unavailable = sum(product.status == "unavailable" for product in products)
     unknown = sum(product.status == "unknown" for product in products)
 
-    if products:
-        print(f"[OK] Testscan erfolgreich: {len(products)} Pokémon-TCG-Produkte gefunden.")
-        print(f"Status: {available} verfügbar, {unavailable} nicht verfügbar, {unknown} unbekannt.")
-        print(f"Dauer:  {duration:.1f} Sekunden")
-        print("[INFO] Der Shop wurde in diesem Schritt noch NICHT gespeichert.")
-    else:
+    if not products:
         print("[WARNUNG] Scanner lief, aber es wurden keine Pokémon-TCG-Produkte gefunden.")
         print("          Der Shop wurde nicht gespeichert.")
+        print("=" * 58)
+        return
+
+    print(f"[OK] Testscan erfolgreich: {len(products)} Pokémon-TCG-Produkte gefunden.")
+    print(f"Status: {available} verfügbar, {unavailable} nicht verfügbar, {unknown} unbekannt.")
+    print(f"Dauer:  {duration:.1f} Sekunden")
+
+    configured = find_configured_shop(detection.final_url)
+    if configured:
+        print("-" * 58)
+        print(f"[INFO] Dieser Shop ist bereits als '{configured['name']}' konfiguriert.")
+        print(f"       Gespeicherte URL: {configured['url']}")
+        print("       Es wurde kein Duplikat angelegt.")
+        print("=" * 58)
+        return
+
+    print("-" * 58)
+    answer = input("Shop dauerhaft hinzufügen? (J/N): ").strip().lower()
+    if answer not in {"j", "ja", "y", "yes"}:
+        print("[INFO] Abgebrochen. Der Shop wurde nicht gespeichert.")
+        print("=" * 58)
+        return
+
+    save_shop_to_config(detection.shop_type, shop_name, detection.final_url)
+    print(f"[OK] '{shop_name}' wurde in shops_config.py gespeichert.")
+    print("[INFO] Eine Sicherung wurde als shops_config.py.bak erstellt.")
+    print("[INFO] Beim nächsten Scan wird der neue Shop automatisch berücksichtigt.")
     print("=" * 58)
 
 def timestamp() -> str:
@@ -443,7 +531,7 @@ def main() -> int:
     parser.add_argument("--scan-prestashop-shops-once", action="store_true")
     parser.add_argument("--scan-all-once", action="store_true")
     parser.add_argument("--detect-shop", metavar="URL", help="Shopsystem einer URL erkennen")
-    parser.add_argument("--add-shop", metavar="URL", help="Shop erkennen und Scanner testweise ausführen (noch ohne Speichern)")
+    parser.add_argument("--add-shop", metavar="URL", help="Shop erkennen, testen und nach Bestätigung speichern")
     parser.add_argument("--workers", type=int, default=5, help="Maximal gleichzeitig geladene Shops (Standard: 5)")
     parser.add_argument("--run", action="store_true", help="Alle Shops dauerhaft in einem Intervall scannen")
     parser.add_argument("--interval", type=int, default=SCAN_INTERVAL_SECONDS, help="Wartezeit zwischen Scanrunden in Sekunden (mindestens 60)")
@@ -456,7 +544,7 @@ def main() -> int:
 
     try:
         if args.add_shop:
-            run_add_shop_preview(args.add_shop)
+            run_add_shop(args.add_shop)
         elif args.detect_shop:
             run_shop_detection(args.detect_shop)
         elif args.test_webhook:
