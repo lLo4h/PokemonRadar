@@ -15,6 +15,7 @@ from shops.wog import scan_wog
 from shops.woocommerce import parse_woocommerce_html, scan_woocommerce
 from shops.prestashop import parse_prestashop_html, scan_prestashop
 from shops_config import PRESTASHOP_SHOPS, SHOPIFY_SHOPS, WOOCOMMERCE_SHOPS
+from shop_detector import detect_shop_type, scanner_name
 
 
 def run_database_demo(send_discord: bool) -> None:
@@ -311,6 +312,31 @@ def run_scan_all_once(max_workers: int = 5) -> dict[str, int]:
     }
 
 
+
+def run_shop_detection(url: str) -> None:
+    print("=" * 58)
+    print("[SHOP-DETEKTIV] Shop wird analysiert …")
+    print(f"Eingegebene URL: {url}")
+    result = detect_shop_type(url)
+    print(f"Erreichte URL:   {result.final_url}")
+    print("-" * 58)
+    if result.shop_type == "unknown":
+        print("[?] Shopsystem konnte nicht sicher erkannt werden.")
+        print("    Das bedeutet nicht automatisch, dass der Shop ungeeignet ist.")
+        print("    Möglicherweise braucht er einen eigenen Scanner.")
+    else:
+        labels = {
+            "shopify": "Shopify",
+            "woocommerce": "WooCommerce",
+            "prestashop": "PrestaShop",
+        }
+        print(f"[OK] Shopsystem erkannt: {labels[result.shop_type]}")
+        print(f"Sicherheit:              {result.confidence}")
+        print(f"Empfohlener Scanner:     {scanner_name(result.shop_type)}")
+        print(f"Erkannte Hinweise:       {', '.join(result.evidence)}")
+    print("=" * 58)
+
+
 def timestamp() -> str:
     return datetime.now().strftime("%d.%m.%Y %H:%M:%S")
 
@@ -353,6 +379,7 @@ def main() -> int:
     parser.add_argument("--scan-woocommerce-shops-once", action="store_true")
     parser.add_argument("--scan-prestashop-shops-once", action="store_true")
     parser.add_argument("--scan-all-once", action="store_true")
+    parser.add_argument("--detect-shop", metavar="URL", help="Shopsystem einer URL erkennen")
     parser.add_argument("--workers", type=int, default=5, help="Maximal gleichzeitig geladene Shops (Standard: 5)")
     parser.add_argument("--run", action="store_true", help="Alle Shops dauerhaft in einem Intervall scannen")
     parser.add_argument("--interval", type=int, default=SCAN_INTERVAL_SECONDS, help="Wartezeit zwischen Scanrunden in Sekunden (mindestens 60)")
@@ -364,7 +391,9 @@ def main() -> int:
     print("[OK] Datenbank wurde vorbereitet.")
 
     try:
-        if args.test_webhook:
+        if args.detect_shop:
+            run_shop_detection(args.detect_shop)
+        elif args.test_webhook:
             send_test_message(); print("[OK] Testnachricht wurde an Discord gesendet.")
         elif args.test_database:
             run_database_demo(False)
@@ -395,7 +424,8 @@ def main() -> int:
                 parser.error("Für --scan-shopify-once fehlt --shop-url.")
             run_shopify_once(args.shop_name, args.shop_url)
         else:
-            print("[INFO] Phase 11 ist bereit.")
+            print("[INFO] PokemonRadar ist bereit.")
+            print("[INFO] Shop erkennen:    python app.py --detect-shop https://shop.ch")
             print("[INFO] Einmaliger Scan: python app.py --scan-all-once")
             print("[INFO] Dauerbetrieb:    python app.py --run")
     except WebhookError as error:
