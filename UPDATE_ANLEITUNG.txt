@@ -1,0 +1,20 @@
+PokemonRadar – Performance-Update
+================================
+
+1. Beende den laufenden Bot mit Strg + C.
+2. Kopiere die Datei app.py aus diesem ZIP in deinen Ordner:
+   C:\Users\lLo4h\Desktop\PokemonRadar
+3. Windows fragt, ob die vorhandene Datei ersetzt werden soll.
+   Wähle: Datei im Ziel ersetzen.
+4. Öffne CMD im PokemonRadar-Ordner.
+5. Teste:
+   python app.py --scan-all-once
+
+Standardmässig werden bis zu 5 Shops gleichzeitig geladen.
+Optional kannst du die Anzahl ändern:
+   python app.py --scan-all-once --workers 3
+   python app.py --run --workers 5
+
+Nach erfolgreichem Test Git speichern:
+   git add app.py
+   git commit -m "Shops parallel scannen"

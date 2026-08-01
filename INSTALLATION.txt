@@ -1,0 +1,8 @@
+PokemonRadar – Shop-Importer Testschritt
+
+1. app.py in den Ordner PokemonRadar kopieren.
+2. Vorhandene app.py ersetzen.
+3. Testen mit:
+   python app.py --add-shop https://pikaversum.ch
+
+Wichtig: Dieser Schritt erkennt und testet den Scanner, speichert den Shop aber noch nicht.
