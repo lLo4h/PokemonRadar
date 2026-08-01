@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from decimal import Decimal, InvalidOperation
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -50,7 +50,7 @@ def _extract_price(text: str) -> str | None:
 
 
 def _product_id(card: Tag, url: str) -> str:
-    for key in ("data-product_id", "data-product-id", "data-id"):
+    for key in ("data-product_id", "data-product-id", "data-id", "data-productid"):
         value = card.get(key)
         if value:
             return str(value)
@@ -63,6 +63,7 @@ def _product_id(card: Tag, url: str) -> str:
 
 def _find_title_link(card: Tag) -> tuple[str, str] | None:
     selectors = (
+        ".wopb-block-title a",
         "h2.woocommerce-loop-product__title a",
         "h2.woocommerce-loop-product__title",
         "h3 a",
@@ -105,7 +106,12 @@ def parse_woocommerce_html(
     html: str, *, shop_name: str, page_url: str, trusted_pokemon_category: bool = False
 ) -> list[Product]:
     soup = BeautifulSoup(html, "html.parser")
-    cards = list(soup.select("li.product, .products .product, article.product"))
+    cards = list(
+        soup.select(
+            "li.product, .products .product, article.product, "
+            ".wopb-block-item"
+        )
+    )
 
     # MetaGames currently uses a SumUp-style storefront rather than classic
     # WooCommerce markup. Its category page exposes product links under
@@ -135,17 +141,57 @@ def parse_woocommerce_html(
 
         text = _normalise(card.get_text(" ", strip=True))
         lower = text.lower()
-        unavailable = any(word in lower for word in ("ausverkauft", "nicht vorrätig", "out of stock", "sold out"))
-        available_marker = bool(card.select_one(".add_to_cart_button, a.add_to_cart_button")) or any(
-            word in lower for word in ("in den warenkorb", "add to cart", "jetzt bestellen")
+        classes = {str(value).lower() for value in card.get("class", [])}
+        strict_stock = urlsplit(page_url).netloc.lower().endswith("cardcollectors.ch")
+
+        unavailable = (
+            bool(classes.intersection({"outofstock", "out-of-stock", "soldout"}))
+            or bool(card.select_one(".outofstock, .out-of-stock, .sold-out"))
+            or any(
+                word in lower
+                for word in (
+                    "ausverkauft",
+                    "nicht vorrätig",
+                    "nicht auf lager",
+                    "out of stock",
+                    "sold out",
+                )
+            )
         )
-        # On category grids, sold-out items are explicitly marked. If no such
-        # marker exists, the product can normally be ordered.
-        available = available_marker or (trusted_pokemon_category and not unavailable)
-        status = "unavailable" if unavailable else "available" if available else "unknown"
+        available_marker = (
+            bool(classes.intersection({"instock", "in-stock"}))
+            or bool(
+                card.select_one(
+                    ".instock, .in-stock, .add_to_cart_button, "
+                    "a.add_to_cart_button, a.ajax_add_to_cart"
+                )
+            )
+            or any(
+                word in lower
+                for word in (
+                    "in den warenkorb",
+                    "add to cart",
+                    "jetzt bestellen",
+                    "vorrätig",
+                    "auf lager",
+                )
+            )
+        )
+
+        if unavailable:
+            status = "unavailable"
+        elif available_marker:
+            status = "available"
+        elif trusted_pokemon_category and not strict_stock:
+            # Bewährtes Verhalten für MetaGames und The Uncommon Shop.
+            status = "available"
+        else:
+            # CardCollectors wird bei fehlendem Lagerhinweis nicht blind als
+            # verfügbar eingestuft. So entstehen keine falschen Restocks.
+            status = "unknown"
         preorder = any(word in lower for word in ("vorbestellung", "vorbestellbar", "preorder", "pre-order"))
 
-        price_node = card.select_one(".price")
+        price_node = card.select_one(".price, .wopb-product-price")
         price = _extract_price(price_node.get_text(" ", strip=True) if price_node else text)
 
         image = card.select_one("img")
@@ -159,6 +205,35 @@ def parse_woocommerce_html(
         seen.add(product_id)
 
     return products
+
+
+def _discover_pokemon_shop_url(soup: BeautifulSoup, current_url: str) -> str | None:
+    """Findet auf Landingpages den eigentlichen Pokémon-Produktkatalog."""
+    selectors = (
+        "a[href*='/shop/brands-pokemon/']",
+        "a[href*='/product-category/pokemon/']",
+        "a[href*='/produkt-kategorie/pokemon/']",
+        "a[href*='/pokemon/'][href*='/shop/']",
+    )
+    for selector in selectors:
+        node = soup.select_one(selector)
+        if not node:
+            continue
+        href = node.get("href")
+        if href:
+            discovered = urljoin(current_url, str(href))
+            parts = urlsplit(discovered)
+            query = parse_qs(parts.query)
+
+            # Warenkorb- und Aktionslinks sind keine neuen Katalogseiten.
+            if "add-to-cart" in query or "remove_item" in query:
+                continue
+
+            current_parts = urlsplit(current_url)
+            same_path = parts.path.rstrip("/") == current_parts.path.rstrip("/")
+            if not same_path:
+                return discovered
+    return None
 
 
 def _next_page(soup: BeautifulSoup, current_url: str) -> str | None:
@@ -179,12 +254,25 @@ def scan_woocommerce(shop_name: str, category_url: str, *, max_pages: int = 10) 
     products: list[Product] = []
     seen_ids: set[str] = set()
     page_url: str | None = category_url
+    catalogue_discovered = False
 
     for _ in range(max_pages):
         if not page_url:
             break
         response = session.get(page_url, headers=headers, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        discovered_url = None
+        if not catalogue_discovered and not products:
+            discovered_url = _discover_pokemon_shop_url(soup, page_url)
+
+        if discovered_url:
+            print(f"[{shop_name}] Produktkatalog gefunden: {discovered_url}")
+            page_url = discovered_url
+            catalogue_discovered = True
+            continue
+
         page_products = parse_woocommerce_html(
             response.text,
             shop_name=shop_name,
@@ -195,7 +283,6 @@ def scan_woocommerce(shop_name: str, category_url: str, *, max_pages: int = 10) 
             if product.product_id not in seen_ids:
                 products.append(product)
                 seen_ids.add(product.product_id)
-        soup = BeautifulSoup(response.text, "html.parser")
         next_url = _next_page(soup, page_url)
         if not next_url or next_url == page_url:
             break

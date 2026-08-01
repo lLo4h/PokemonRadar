@@ -12,6 +12,7 @@ SHOPIFY_SHOPS = [
 WOOCOMMERCE_SHOPS = [
     {"name": "MetaGames", "url": "https://metagames.ch/kategorie/pokemon", "max_pages": 10},
     {"name": "The Uncommon Shop", "url": "https://theuncommonshop.ch/produktkategorie/pokemon/", "max_pages": 10},
+    {"name": "Cardcollectors", "url": "https://cardcollectors.ch/pokemon/", "max_pages": 10},
 ]
 
 PRESTASHOP_SHOPS = [
