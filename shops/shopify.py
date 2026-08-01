@@ -17,12 +17,13 @@ from models import Product
 # Verhindert, dass Retries unmittelbar erneut auf denselben Shop treffen.
 _DOMAIN_LOCK = threading.Lock()
 _DOMAIN_NEXT_REQUEST: dict[str, float] = {}
+_DOMAIN_429_COUNT: dict[str, int] = {}
 
 # Kleine Streuung verhindert, dass alle Shopify-Shops exakt gleichzeitig starten.
-INITIAL_JITTER_SECONDS = (1.0, 4.0)
+INITIAL_JITTER_SECONDS = (3.0, 12.0)
 
 # Mindestwartezeit nach HTTP 429, falls der Shop keinen Retry-After-Header sendet.
-RATE_LIMIT_FALLBACK_SECONDS = (30.0, 60.0)
+RATE_LIMIT_FALLBACK_SECONDS = (180.0, 300.0)
 
 
 POKEMON_WORDS = ("pokemon", "pokémon")
@@ -200,11 +201,29 @@ def _wait_for_domain(domain: str) -> None:
         time.sleep(remaining)
 
 
-def _set_domain_cooldown(domain: str, seconds: float) -> None:
+def _set_domain_cooldown(domain: str, seconds: float) -> float:
+    """Setzt eine ansteigende Sperrzeit, wenn eine Domain wiederholt 429 liefert."""
     seconds = max(0.0, float(seconds))
     with _DOMAIN_LOCK:
+        count = _DOMAIN_429_COUNT.get(domain, 0) + 1
+        _DOMAIN_429_COUNT[domain] = count
+
+        # Wiederholte 429 innerhalb derselben Laufzeit verlängern die Pause.
+        multiplier = min(4, count)
+        effective = min(1800.0, max(120.0, seconds) * multiplier)
+
         current = _DOMAIN_NEXT_REQUEST.get(domain, 0.0)
-        _DOMAIN_NEXT_REQUEST[domain] = max(current, time.monotonic() + seconds)
+        _DOMAIN_NEXT_REQUEST[domain] = max(
+            current,
+            time.monotonic() + effective,
+        )
+    return effective
+
+
+def _clear_domain_rate_limit(domain: str) -> None:
+    """Ein erfolgreicher Abruf setzt den 429-Zähler wieder zurück."""
+    with _DOMAIN_LOCK:
+        _DOMAIN_429_COUNT.pop(domain, None)
 
 
 def _retry_after_seconds(response: requests.Response) -> float:
@@ -247,14 +266,15 @@ def _request_json(endpoint: str) -> dict[str, Any]:
     )
 
     if response.status_code == 429:
-        cooldown = _retry_after_seconds(response)
-        _set_domain_cooldown(domain, cooldown)
+        requested_cooldown = _retry_after_seconds(response)
+        cooldown = _set_domain_cooldown(domain, requested_cooldown)
         print(
             f"[SHOPIFY] {domain}: HTTP 429 erhalten. "
-            f"Nächster Versuch frühestens in {cooldown:.1f} Sekunde(n)."
+            f"Domain wird für {cooldown:.1f} Sekunde(n) pausiert."
         )
 
     response.raise_for_status()
+    _clear_domain_rate_limit(domain)
 
     try:
         data = response.json()

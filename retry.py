@@ -29,8 +29,7 @@ def _is_retryable(error: BaseException) -> bool:
             return True
 
         status = response.status_code
-        return status in {408, 425, 429} or 500 <= status <= 599
-
+        # HTTP 429 wird bereits im jeweiligen Scanner mit einer Domain-\n        # Sperrzeit behandelt. Ein sofortiger Retry würde nur einen Worker\n        # minutenlang blockieren und den Shop nochmals belasten.\n        if status == 429:\n            return False\n        return status in {408, 425} or 500 <= status <= 599\n
     return False
 
 

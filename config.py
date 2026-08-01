@@ -35,21 +35,28 @@ SCAN_INTERVAL_SECONDS = _read_scan_interval()
 # Scheduler
 # ==========================================================
 
-MAX_WORKERS = 5
-DEFAULT_SHOP_INTERVAL_SECONDS = 60
+MAX_WORKERS = 3
+DEFAULT_SHOP_INTERVAL_SECONDS = 180
 
 SHOP_INTERVALS = {
-    "World of Games": 15,
-    "Toytans": 30,
-    "Pokelu": 30,
-    "MetaGames": 30,
-    "The Uncommon Shop": 30,
-    "Pikaversum": 45,
-    "Pokealp": 45,
-    "MaRo Games Shop": 45,
-    "Ryu Land": 60,
-    "JapHunter": 60,
-    "Zadoys": 60,
+    # Nicht-Shopify: etwas häufiger, weil diese Shops aktuell keine 429-Welle zeigen.
+    "World of Games": 60,
+    "Toytans": 180,
+    "Pokelu": 180,
+    "MetaGames": 180,
+    "The Uncommon Shop": 180,
+    "Cardcollectors": 240,
+
+    # Shopify: bewusst schonender. Mehrere dieser Shops blockierten die
+    # gemeinsame Server-IP bei Intervallen von 45 bis 90 Sekunden.
+    "Pikaversum": 300,
+    "Pokealp": 300,
+    "MaRo Games Shop": 300,
+    "Ryu Land": 300,
+    "JapHunter": 300,
+    "Zadoys": 300,
+    "Sparkleaf": 300,
+    "Boosterbox": 300,
 }
 
 
@@ -59,7 +66,7 @@ SHOP_INTERVALS = {
 # ==========================================================
 
 RETRY_ATTEMPTS = 3
-RETRY_DELAYS = (2, 5)
+RETRY_DELAYS = (5, 15)
 
 
 # ==========================================================
