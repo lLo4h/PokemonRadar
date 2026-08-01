@@ -1,11 +1,93 @@
 import argparse
 import json
+import os
 import re
+import subprocess
+import sys
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
+
+
+def _auto_update_before_imports() -> None:
+    """Aktualisiert das Git-Repository vor dem Import der Projektmodule.
+
+    Auf Quaxly ist AUTO_UPDATE=1 gesetzt. Falls ein neuer Commit geladen wurde,
+    startet sich der Python-Prozess einmal selbst neu, damit auch aktualisierte
+    Module wie config.py, notifier.py und Scanner wirklich verwendet werden.
+    """
+    if os.getenv("AUTO_UPDATE", "").strip() != "1":
+        return
+
+    # Verhindert eine Neustartschleife innerhalb desselben Serverstarts.
+    if os.getenv("POKEMONRADAR_UPDATED", "").strip() == "1":
+        return
+
+    project_dir = Path(__file__).resolve().parent
+    git_dir = project_dir / ".git"
+    if not git_dir.is_dir():
+        print(f"[AUTO-UPDATE] Kein Git-Repository gefunden: {git_dir}")
+        return
+
+    try:
+        before = subprocess.run(
+            ["git", "-C", str(project_dir), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        ).stdout.strip()
+
+        pull = subprocess.run(
+            ["git", "-C", str(project_dir), "pull", "--ff-only"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        output = "\n".join(
+            part.strip()
+            for part in (pull.stdout, pull.stderr)
+            if part and part.strip()
+        )
+        if output:
+            print(f"[AUTO-UPDATE] {output}")
+
+        after = subprocess.run(
+            ["git", "-C", str(project_dir), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        ).stdout.strip()
+
+        if before != after:
+            print(f"[AUTO-UPDATE] Neuer Stand geladen: {before[:7]} -> {after[:7]}")
+            print("[AUTO-UPDATE] Starte Pokémon Radar mit dem neuen Code neu …")
+            env = os.environ.copy()
+            env["POKEMONRADAR_UPDATED"] = "1"
+            os.execve(
+                sys.executable,
+                [sys.executable, str(project_dir / "app.py"), *sys.argv[1:]],
+                env,
+            )
+        else:
+            print(f"[AUTO-UPDATE] Bereits aktuell ({after[:7]}).")
+
+    except FileNotFoundError:
+        print("[AUTO-UPDATE] Git ist auf diesem Server nicht installiert.")
+    except subprocess.TimeoutExpired:
+        print("[AUTO-UPDATE] Git-Aktualisierung hat zu lange gedauert. Starte ohne Update.")
+    except subprocess.CalledProcessError as error:
+        details = (error.stderr or error.stdout or str(error)).strip()
+        print(f"[AUTO-UPDATE] Git-Aktualisierung fehlgeschlagen: {details}")
+
+
+_auto_update_before_imports()
+
 
 import requests
 
