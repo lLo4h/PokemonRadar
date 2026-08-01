@@ -60,6 +60,10 @@ def init_db() -> None:
 PRICE_CHANGE_MIN_CHF = Decimal("5.00")
 PRICE_CHANGE_MIN_PERCENT = Decimal("5.00")
 
+# Ein Preisnachlass gilt als Deal, wenn mindestens eine Grenze erreicht wird.
+DEAL_MIN_CHF = Decimal("10.00")
+DEAL_MIN_PERCENT = Decimal("10.00")
+
 
 def _price_amount(value: str | None) -> Decimal | None:
     """Liest Preise wie CHF 69.90, 69,90 oder 1'299.00 robust ein."""
@@ -92,6 +96,21 @@ def _is_relevant_price_change(old_price: str | None, new_price: str | None) -> b
         difference >= PRICE_CHANGE_MIN_CHF
         or percent >= PRICE_CHANGE_MIN_PERCENT
     )
+
+
+def _is_deal(old_price: str | None, new_price: str | None) -> bool:
+    """Erkennt deutliche Preissenkungen als Deal."""
+    old_amount = _price_amount(old_price)
+    new_amount = _price_amount(new_price)
+
+    if old_amount is None or new_amount is None or old_amount <= 0:
+        return False
+    if new_amount >= old_amount:
+        return False
+
+    saving = old_amount - new_amount
+    percent = (saving / old_amount) * Decimal("100")
+    return saving >= DEAL_MIN_CHF or percent >= DEAL_MIN_PERCENT
 
 
 def save_product(product: Product, *, initial_scan: bool) -> list[ProductChange]:
@@ -158,9 +177,10 @@ def save_product(product: Product, *, initial_scan: bool) -> list[ProductChange]
                 )
 
             if _is_relevant_price_change(old_price, product.price):
+                change_kind = "deal" if _is_deal(old_price, product.price) else "price_change"
                 changes.append(
                     ProductChange(
-                        "price_change",
+                        change_kind,
                         product,
                         old_status=old_status,
                         old_price=old_price,

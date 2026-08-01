@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 import re
 from decimal import Decimal, InvalidOperation
@@ -11,6 +12,7 @@ import requests
 
 from config import DISCORD_WEBHOOK, REQUEST_TIMEOUT
 from database import ProductChange
+from product_classifier import classify_product
 
 
 class WebhookError(RuntimeError):
@@ -97,6 +99,7 @@ LABELS = {
     "new_product": ("🆕 Neu im Shop", 0x3498DB),
     "new_preorder": ("📦 Vorbestellung geöffnet", 0x9B59B6),
     "restock": ("🔥 Wieder verfügbar", 0x2ECC71),
+    "deal": ("🔥 Deal erkannt", 0x2ECC71),
     "price_change": ("💰 Preisänderung", 0xF1C40F),
 }
 
@@ -165,8 +168,11 @@ def _rich_product_embed(change: ProductChange) -> dict[str, Any]:
     label, color = LABELS.get(change.kind, ("Produktänderung", 0x95A5A6))
     price_difference_text: str | None = None
 
-    if change.kind == "price_change":
+    if change.kind in {"price_change", "deal"}:
         label, color, price_difference_text = _price_change_details(change)
+        if change.kind == "deal":
+            label = "🔥 Deal erkannt"
+            color = 0x2ECC71
 
     # Ereignisfarben bleiben eindeutig. Nur ein widersprüchlicher Restock-Test
     # mit "nicht verfügbar" wird rot dargestellt.
@@ -203,7 +209,33 @@ def _rich_product_embed(change: ProductChange) -> dict[str, Any]:
             }
         )
 
-    if change.kind == "price_change" and change.old_price:
+    classification = classify_product(product.title)
+    if classification.set_name:
+        fields.append(
+            {
+                "name": "🧩 Set",
+                "value": classification.set_name,
+                "inline": True,
+            }
+        )
+    if classification.product_type:
+        fields.append(
+            {
+                "name": "📦 Typ",
+                "value": classification.product_type,
+                "inline": True,
+            }
+        )
+    if classification.language:
+        fields.append(
+            {
+                "name": "🌐 Sprache",
+                "value": classification.language,
+                "inline": True,
+            }
+        )
+
+    if change.kind in {"price_change", "deal"} and change.old_price:
         fields.append(
             {
                 "name": "↩️ Vorher",
@@ -244,7 +276,7 @@ def _compact_product_line(change: ProductChange) -> str:
     details: list[str] = []
     if product.price:
         details.append(product.price)
-    if change.kind == "price_change" and change.old_price:
+    if change.kind in {"price_change", "deal"} and change.old_price:
         details.append(f"vorher {change.old_price}")
     if product.status:
         details.append(STATUS_LABELS.get(product.status, product.status))
@@ -277,7 +309,7 @@ def _compact_group_embeds(
     grouped: dict[str, list[ProductChange]],
 ) -> list[dict[str, Any]]:
     embeds: list[dict[str, Any]] = []
-    order = ("new_product", "new_preorder", "restock", "price_change")
+    order = ("new_product", "new_preorder", "restock", "deal", "price_change")
 
     for kind in order:
         kind_changes = grouped.get(kind, [])
@@ -342,12 +374,44 @@ def _make_batches(
     return batches
 
 
+ROLE_ENV_BY_KIND = {
+    "restock": "RESTOCK_ROLE_ID",
+    "deal": "DEAL_ROLE_ID",
+    "new_preorder": "PREORDER_ROLE_ID",
+}
+
+
+def _role_ids_for_changes(changes: Iterable[ProductChange]) -> list[str]:
+    """Liest nur die Rollen aus, die zu den enthaltenen Meldungstypen passen."""
+    role_ids: list[str] = []
+    seen: set[str] = set()
+
+    for change in changes:
+        env_name = ROLE_ENV_BY_KIND.get(change.kind)
+        if not env_name:
+            continue
+
+        role_id = os.getenv(env_name, "").strip()
+        if role_id and role_id.isdigit() and role_id not in seen:
+            role_ids.append(role_id)
+            seen.add(role_id)
+
+    return role_ids
+
+
+def _role_mention_text(role_ids: Iterable[str]) -> str:
+    return " ".join(f"<@&{role_id}>" for role_id in role_ids)
+
+
 def send_product_changes(shop_name: str, changes: Iterable[ProductChange]) -> int:
     """Sendet kleine Mengen mit grossen Bildern, grosse Mengen kompakt."""
     change_list = list(changes)
     total = len(change_list)
     if total == 0:
         return 0
+
+    role_ids = _role_ids_for_changes(change_list)
+    role_mentions = _role_mention_text(role_ids)
 
     grouped: dict[str, list[ProductChange]] = defaultdict(list)
     for change in change_list:
@@ -365,16 +429,24 @@ def send_product_changes(shop_name: str, changes: Iterable[ProductChange]) -> in
 
     message_count = 0
     for index, embed_batch in enumerate(batches, start=1):
-        content = f"**{shop_name}** – {total} Produktänderung(en)"
+        summary = f"**{shop_name}** – {total} Produktänderung(en)"
         if len(batches) > 1:
-            content += f" – Nachricht {index}/{len(batches)}"
+            summary += f" – Nachricht {index}/{len(batches)}"
+
+        # Rollen werden nur in der ersten Nachricht eines Batches erwähnt,
+        # damit bei mehreren Discord-Nachrichten kein Mehrfach-Ping entsteht.
+        content = summary
+        allowed_mentions: dict[str, Any] = {"parse": []}
+        if index == 1 and role_mentions:
+            content = f"{role_mentions}\n{summary}"
+            allowed_mentions["roles"] = role_ids
 
         _post(
             {
                 "username": "Pokémon Radar",
                 "content": content,
                 "embeds": embed_batch,
-                "allowed_mentions": {"parse": []},
+                "allowed_mentions": allowed_mentions,
             }
         )
         message_count += 1
