@@ -8,6 +8,7 @@ from typing import Callable, Iterable, Protocol, TypeVar
 
 from config import DASHBOARD_REFRESH_SECONDS
 from logging_utils import console_write, set_dashboard_mode
+from retry import RetryOutcome
 
 
 T = TypeVar("T")
@@ -28,6 +29,8 @@ class JobState:
     scans_started: int = 0
     scans_ok: int = 0
     errors: int = 0
+    retries_total: int = 0
+    last_retries: int = 0
     last_duration: float | None = None
     last_products: int | None = None
     last_notifications: int = 0
@@ -72,6 +75,7 @@ def _render_dashboard(
     total_products: int,
     total_notifications: int,
     total_errors: int,
+    total_retries: int,
 ) -> None:
     now = time.monotonic()
     active = sum(state.future is not None for state in states)
@@ -82,7 +86,8 @@ def _render_dashboard(
         f"Uptime: {_format_uptime(now - started_at)}   "
         f"Aktive Scans: {active}/{max_workers}   "
         f"Produkte geprüft: {total_products:,}".replace(",", "'"),
-        f"Discord-Änderungen: {total_notifications}   Fehler: {total_errors}   "
+        f"Discord-Änderungen: {total_notifications}   "
+        f"Retries: {total_retries}   Fehler: {total_errors}   "
         f"Log: logs/{datetime.now().strftime('%Y-%m-%d')}.log",
         "-" * 78,
         f"{'Shop':<24} {'Intervall':>9}  {'Status':<22} {'Letzter Scan':<16}",
@@ -94,7 +99,8 @@ def _render_dashboard(
         if state.last_finished_at is not None:
             duration = f"{state.last_duration:.1f}s" if state.last_duration is not None else ""
             products = f"{state.last_products} Prod." if state.last_products is not None else ""
-            last_scan = f"{duration} {products}".strip()
+            retry_info = f"R{state.last_retries}" if state.last_retries else ""
+            last_scan = f"{duration} {products} {retry_info}".strip()
         lines.append(
             f"{state.name:<24} {state.interval_seconds:>6}s   "
             f"{_status_text(state, now):<22} {last_scan:<16}"
@@ -153,6 +159,7 @@ def run_shop_scheduler(
     total_products = 0
     total_notifications = 0
     total_errors = 0
+    total_retries = 0
     last_dashboard_refresh = 0.0
 
     print("=" * 64)
@@ -170,6 +177,7 @@ def run_shop_scheduler(
             total_products=0,
             total_notifications=0,
             total_errors=0,
+            total_retries=0,
         )
     else:
         print("-" * 64)
@@ -195,7 +203,21 @@ def run_shop_scheduler(
 
                     print(f"\n[{_timestamp()}] [{state.name}] Download abgeschlossen ({duration:.1f} s).")
                     try:
-                        products = future.result()
+                        outcome = future.result()
+                        if isinstance(outcome, RetryOutcome):
+                            products = outcome.value
+                            state.last_retries = outcome.retries
+                        else:
+                            products = outcome
+                            state.last_retries = 0
+
+                        state.retries_total += state.last_retries
+                        total_retries += state.last_retries
+                        if state.last_retries:
+                            print(
+                                f"[{state.name}] Scan nach {state.last_retries} Retry(s) erfolgreich."
+                            )
+
                         result = process_result(state.name, products)
                         state.scans_ok += 1
                         state.last_error = ""
@@ -211,6 +233,7 @@ def run_shop_scheduler(
                         total_notifications += state.last_notifications
                     except Exception as error:
                         state.errors += 1
+                        state.last_retries = 0
                         total_errors += 1
                         state.last_error = f"{type(error).__name__}: {error}"
                         print(f"[{state.name}] FEHLER: {state.last_error}")
@@ -250,6 +273,7 @@ def run_shop_scheduler(
                         total_products=total_products,
                         total_notifications=total_notifications,
                         total_errors=total_errors,
+                        total_retries=total_retries,
                     )
                     last_dashboard_refresh = now
 

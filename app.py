@@ -25,7 +25,9 @@ from shops.woocommerce import parse_woocommerce_html, scan_woocommerce
 from shops.prestashop import parse_prestashop_html, scan_prestashop
 from shops_config import PRESTASHOP_SHOPS, SHOPIFY_SHOPS, WOOCOMMERCE_SHOPS
 from shop_detector import detect_shop_type, scanner_name
+from health import run_health_check
 from logging_utils import setup_console_logging
+from retry import RetryOutcome, run_with_retry
 from scheduler import run_shop_scheduler
 
 
@@ -240,13 +242,18 @@ def shop_interval_seconds(shop_name: str) -> int:
     return int(SHOP_INTERVALS.get(shop_name, DEFAULT_SHOP_INTERVAL_SECONDS))
 
 
+def retrying_scanner(shop_name: str, scanner):
+    """Verpackt einen Scanner mit dem zentralen Retry-System."""
+    return lambda: run_with_retry(scanner, label=shop_name)
+
+
 def build_scan_jobs() -> list[dict[str, object]]:
     """Erstellt die Liste aller konfigurierten Shop-Scans."""
     jobs: list[dict[str, object]] = [
         {
             "name": WOG_SHOP_NAME,
             "interval_seconds": shop_interval_seconds(WOG_SHOP_NAME),
-            "scanner": scan_wog,
+            "scanner": retrying_scanner(WOG_SHOP_NAME, scan_wog),
         }
     ]
 
@@ -255,7 +262,10 @@ def build_scan_jobs() -> list[dict[str, object]]:
             {
                 "name": shop["name"],
                 "interval_seconds": shop_interval_seconds(shop["name"]),
-                "scanner": lambda shop=shop: scan_shopify(shop["name"], shop["url"]),
+                "scanner": retrying_scanner(
+                    shop["name"],
+                    lambda shop=shop: scan_shopify(shop["name"], shop["url"]),
+                ),
             }
         )
 
@@ -264,10 +274,13 @@ def build_scan_jobs() -> list[dict[str, object]]:
             {
                 "name": shop["name"],
                 "interval_seconds": shop_interval_seconds(shop["name"]),
-                "scanner": lambda shop=shop: scan_woocommerce(
+                "scanner": retrying_scanner(
                     shop["name"],
-                    shop["url"],
-                    max_pages=int(shop.get("max_pages", 10)),
+                    lambda shop=shop: scan_woocommerce(
+                        shop["name"],
+                        shop["url"],
+                        max_pages=int(shop.get("max_pages", 10)),
+                    ),
                 ),
             }
         )
@@ -277,10 +290,13 @@ def build_scan_jobs() -> list[dict[str, object]]:
             {
                 "name": shop["name"],
                 "interval_seconds": shop_interval_seconds(shop["name"]),
-                "scanner": lambda shop=shop: scan_prestashop(
+                "scanner": retrying_scanner(
                     shop["name"],
-                    shop["url"],
-                    max_pages=int(shop.get("max_pages", 70)),
+                    lambda shop=shop: scan_prestashop(
+                        shop["name"],
+                        shop["url"],
+                        max_pages=int(shop.get("max_pages", 70)),
+                    ),
                 ),
             }
         )
@@ -322,7 +338,13 @@ def run_scan_all_once(max_workers: int = 5) -> dict[str, int]:
             name = future_to_name[future]
             print(f"\n[{name}] Download abgeschlossen – Produkte werden verarbeitet …")
             try:
-                products = future.result()
+                outcome = future.result()
+                if isinstance(outcome, RetryOutcome):
+                    products = outcome.value
+                    if outcome.retries:
+                        print(f"[{name}] Scan nach {outcome.retries} Retry(s) erfolgreich.")
+                else:
+                    products = outcome
                 result = process_products(name, products)
                 total_products += result["products"]
                 total_notifications += result["notifications"]
@@ -558,6 +580,7 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=MAX_WORKERS, help=f"Maximal gleichzeitig geladene Shops (Standard: {MAX_WORKERS})")
     parser.add_argument("--run", action="store_true", help="Scheduler mit individuellen Shop-Intervallen starten")
     parser.add_argument("--dashboard", action="store_true", help="Live-Dashboard im Terminal anzeigen")
+    parser.add_argument("--health", action="store_true", help="Lokalen Gesundheitscheck ausführen")
     parser.add_argument("--interval", type=int, default=SCAN_INTERVAL_SECONDS, help="Veraltete Option; der Scheduler nutzt individuelle Shop-Intervalle")
     parser.add_argument("--shop-name", default="Shopify Shop")
     parser.add_argument("--shop-url")
@@ -567,7 +590,9 @@ def main() -> int:
     print("[OK] Datenbank wurde vorbereitet.")
 
     try:
-        if args.add_shop:
+        if args.health:
+            return 0 if run_health_check() else 1
+        elif args.add_shop:
             run_add_shop(args.add_shop)
         elif args.detect_shop:
             run_shop_detection(args.detect_shop)
@@ -606,6 +631,7 @@ def main() -> int:
             print("[INFO] Einmaliger Scan: python app.py --scan-all-once")
             print("[INFO] Dauerbetrieb:    python app.py --run")
             print("[INFO] Live-Dashboard:  python app.py --run --dashboard")
+            print("[INFO] Health Check:    python app.py --health")
     except WebhookError as error:
         print(f"[FEHLER] {error}"); return 1
     except requests.exceptions.HTTPError as error:
