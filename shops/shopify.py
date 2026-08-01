@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
+import random
+import threading
+import time
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
@@ -8,6 +12,18 @@ import requests
 
 from config import REQUEST_TIMEOUT, USER_AGENT
 from models import Product
+
+# Schonende Anfrageplanung pro Shop-Domain.
+# Verhindert, dass Retries unmittelbar erneut auf denselben Shop treffen.
+_DOMAIN_LOCK = threading.Lock()
+_DOMAIN_NEXT_REQUEST: dict[str, float] = {}
+
+# Kleine Streuung verhindert, dass alle Shopify-Shops exakt gleichzeitig starten.
+INITIAL_JITTER_SECONDS = (1.0, 4.0)
+
+# Mindestwartezeit nach HTTP 429, falls der Shop keinen Retry-After-Header sendet.
+RATE_LIMIT_FALLBACK_SECONDS = (30.0, 60.0)
+
 
 POKEMON_WORDS = ("pokemon", "pokémon")
 TCG_WORDS = (
@@ -169,18 +185,75 @@ def _shopify_endpoint(shop_url: str) -> str:
     return urljoin(base_url, "/products.json?limit=250")
 
 
-def scan_shopify(shop_name: str, shop_url: str) -> list[Product]:
-    base_url = _clean_base_url(shop_url)
-    endpoint = _shopify_endpoint(shop_url)
+def _domain_key(url: str) -> str:
+    return (urlparse(url).hostname or url).lower()
+
+
+def _wait_for_domain(domain: str) -> None:
+    """Wartet, wenn dieser Shop zuvor ein Rate-Limit gemeldet hat."""
+    with _DOMAIN_LOCK:
+        wait_until = _DOMAIN_NEXT_REQUEST.get(domain, 0.0)
+
+    remaining = wait_until - time.monotonic()
+    if remaining > 0:
+        print(f"[SHOPIFY] {domain}: Rate-Limit-Pause noch {remaining:.1f} Sekunde(n).")
+        time.sleep(remaining)
+
+
+def _set_domain_cooldown(domain: str, seconds: float) -> None:
+    seconds = max(0.0, float(seconds))
+    with _DOMAIN_LOCK:
+        current = _DOMAIN_NEXT_REQUEST.get(domain, 0.0)
+        _DOMAIN_NEXT_REQUEST[domain] = max(current, time.monotonic() + seconds)
+
+
+def _retry_after_seconds(response: requests.Response) -> float:
+    """Liest Retry-After als Sekunden oder HTTP-Datum."""
+    value = (response.headers.get("Retry-After") or "").strip()
+    if value:
+        try:
+            return max(0.0, float(value))
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(value)
+                now = parsedate_to_datetime(response.headers.get("Date", "")) if response.headers.get("Date") else None
+                if now is None:
+                    from datetime import datetime, timezone
+                    now = datetime.now(timezone.utc)
+                return max(0.0, (retry_at - now).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+    return random.uniform(*RATE_LIMIT_FALLBACK_SECONDS)
+
+
+def _request_json(endpoint: str) -> dict[str, Any]:
+    domain = _domain_key(endpoint)
+
+    # Die erste Anfrage jedes Scans leicht versetzen, damit die Shops nicht
+    # als starre gleichzeitige Welle abgefragt werden.
+    time.sleep(random.uniform(*INITIAL_JITTER_SECONDS))
+    _wait_for_domain(domain)
+
     response = requests.get(
         endpoint,
         headers={
             "User-Agent": USER_AGENT,
             "Accept": "application/json",
             "Accept-Language": "de-CH,de;q=0.9",
+            "Cache-Control": "no-cache",
         },
         timeout=REQUEST_TIMEOUT,
     )
+
+    if response.status_code == 429:
+        cooldown = _retry_after_seconds(response)
+        _set_domain_cooldown(domain, cooldown)
+        print(
+            f"[SHOPIFY] {domain}: HTTP 429 erhalten. "
+            f"Nächster Versuch frühestens in {cooldown:.1f} Sekunde(n)."
+        )
+
     response.raise_for_status()
 
     try:
@@ -189,6 +262,16 @@ def scan_shopify(shop_name: str, shop_url: str) -> list[Product]:
         raise RuntimeError(
             "Der Shop liefert unter /products.json keine Shopify-Produktliste."
         ) from error
+
+    if not isinstance(data, dict):
+        raise RuntimeError("Shopify-Antwort hat ein unerwartetes Format.")
+    return data
+
+
+def scan_shopify(shop_name: str, shop_url: str) -> list[Product]:
+    base_url = _clean_base_url(shop_url)
+    endpoint = _shopify_endpoint(shop_url)
+    data = _request_json(endpoint)
 
     products = parse_shopify_products(data, shop_name=shop_name, shop_url=base_url)
     if not products:
