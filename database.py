@@ -1,4 +1,6 @@
 import sqlite3
+import re
+from decimal import Decimal, InvalidOperation
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -55,6 +57,43 @@ def init_db() -> None:
         connection.commit()
 
 
+PRICE_CHANGE_MIN_CHF = Decimal("5.00")
+PRICE_CHANGE_MIN_PERCENT = Decimal("5.00")
+
+
+def _price_amount(value: str | None) -> Decimal | None:
+    """Liest Preise wie CHF 69.90, 69,90 oder 1'299.00 robust ein."""
+    if not value:
+        return None
+
+    match = re.search(r"-?[0-9][0-9'’.,]*", value)
+    if not match:
+        return None
+
+    raw = match.group(0).replace("'", "").replace("’", "").replace(",", ".")
+    try:
+        return Decimal(raw)
+    except InvalidOperation:
+        return None
+
+
+def _is_relevant_price_change(old_price: str | None, new_price: str | None) -> bool:
+    """Meldet Änderungen ab CHF 5 oder ab 5 Prozent."""
+    old_amount = _price_amount(old_price)
+    new_amount = _price_amount(new_price)
+
+    if old_amount is None or new_amount is None or old_amount <= 0:
+        return False
+
+    difference = abs(new_amount - old_amount)
+    percent = (difference / old_amount) * Decimal("100")
+
+    return (
+        difference >= PRICE_CHANGE_MIN_CHF
+        or percent >= PRICE_CHANGE_MIN_PERCENT
+    )
+
+
 def save_product(product: Product, *, initial_scan: bool) -> list[ProductChange]:
     """Speichert ein Produkt und gibt erkannte Änderungen zurück.
 
@@ -96,9 +135,13 @@ def save_product(product: Product, *, initial_scan: bool) -> list[ProductChange]
             )
 
             if not initial_scan:
-                changes.append(ProductChange("new_product", product))
+                # Eine neue Vorbestellung ist bereits eine vollständige Meldung.
+                # Dadurch wird dasselbe Produkt nicht zusätzlich als
+                # "Neues Produkt" doppelt an Discord geschickt.
                 if product.is_preorder:
                     changes.append(ProductChange("new_preorder", product))
+                else:
+                    changes.append(ProductChange("new_product", product))
         else:
             old_status = existing["status"]
             old_price = existing["price"]
@@ -114,7 +157,7 @@ def save_product(product: Product, *, initial_scan: bool) -> list[ProductChange]
                     )
                 )
 
-            if old_price != product.price and old_price is not None:
+            if _is_relevant_price_change(old_price, product.price):
                 changes.append(
                     ProductChange(
                         "price_change",

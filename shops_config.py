@@ -5,6 +5,7 @@ SHOPIFY_SHOPS = [
     {"name": "Pokealp", "url": "https://pokealp.ch/de/collections/pokemon"},
     {"name": "JapHunter", "url": "https://japhunter.ch/de/collections/pokemon"},
     {"name": "Zadoys", "url": "https://zadoys.ch/collections/pokemon-karten"},
+    {"name": "Sparkleaf", "url": "https://sparkleaf.ch/fr/pages/cartes-pokemon"},
 ]
 
 WOOCOMMERCE_SHOPS = [

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import time
+import re
+from decimal import Decimal, InvalidOperation
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 import requests
@@ -31,8 +34,6 @@ def _retry_after_seconds(response: requests.Response) -> float:
     except (ValueError, TypeError, requests.exceptions.JSONDecodeError):
         value = 1.0
 
-    # Discord liefert normalerweise Sekunden. Sehr grosse Werte behandeln wir
-    # vorsichtshalber als Millisekunden.
     if value > 1000:
         value /= 1000
     return max(0.5, value)
@@ -69,7 +70,6 @@ def _post(payload: dict[str, Any], *, max_retries: int = 8) -> None:
             time.sleep(wait_seconds)
             continue
 
-        # Vorübergehende Discord-Serverfehler ebenfalls erneut versuchen.
         if 500 <= response.status_code < 600 and attempt < max_retries:
             time.sleep(min(2 ** attempt, 10))
             continue
@@ -86,26 +86,160 @@ def send_test_message() -> None:
     _post(
         {
             "username": "Pokémon Radar",
-            "content": "✅ **Pokémon Radar V3 ist verbunden.**\n"
-                       "Rate-Limit-Schutz und Sammelmeldungen sind aktiv.",
+            "content": "✅ **Pokémon Radar V4 ist verbunden.**\n"
+                       "Produktbilder und professionelle Embeds sind aktiv.",
             "allowed_mentions": {"parse": []},
         }
     )
 
 
 LABELS = {
-    "new_product": ("🆕 Neue Produkte", 0x3498DB),
-    "new_preorder": ("📦 Neue Vorbestellungen", 0x9B59B6),
+    "new_product": ("🆕 Neu im Shop", 0x3498DB),
+    "new_preorder": ("📦 Vorbestellung geöffnet", 0x9B59B6),
     "restock": ("🔥 Wieder verfügbar", 0x2ECC71),
-    "price_change": ("💰 Preisänderungen", 0xF1C40F),
+    "price_change": ("💰 Preisänderung", 0xF1C40F),
 }
 
+STATUS_LABELS = {
+    "available": "🟢 Verfügbar",
+    "unavailable": "🔴 Nicht verfügbar",
+    "unknown": "⚪ Unbekannt",
+}
 
-def _product_line(change: ProductChange) -> str:
+MAX_RICH_EMBEDS_PER_BATCH = 5
+
+
+def _clean_title(value: str, *, max_length: int = 256) -> str:
+    title = " ".join(value.split())
+    if len(title) > max_length:
+        return title[: max_length - 1] + "…"
+    return title
+
+
+def _safe_value(value: str | None, *, fallback: str = "Keine Angabe") -> str:
+    cleaned = " ".join((value or "").split())
+    return cleaned[:1024] if cleaned else fallback
+
+
+def _price_amount(value: str | None) -> Decimal | None:
+    if not value:
+        return None
+    match = re.search(r"-?[0-9][0-9'’.,]*", value)
+    if not match:
+        return None
+    raw = match.group(0).replace("'", "").replace("’", "").replace(",", ".")
+    try:
+        return Decimal(raw)
+    except InvalidOperation:
+        return None
+
+
+def _price_change_details(change: ProductChange) -> tuple[str, int, str | None]:
+    """Erstellt Richtung, Farbe und Differenz für Preisänderungen."""
+    old_amount = _price_amount(change.old_price)
+    new_amount = _price_amount(change.product.price)
+
+    if old_amount is None or new_amount is None:
+        return "💰 Preisänderung", 0xF1C40F, None
+
+    difference = new_amount - old_amount
+    percent = (abs(difference) / old_amount * Decimal("100")) if old_amount else Decimal("0")
+
+    if difference < 0:
+        label = "📉 Preis gesunken"
+        color = 0x2ECC71
+        direction = "günstiger"
+    elif difference > 0:
+        label = "📈 Preis erhöht"
+        color = 0xE67E22
+        direction = "teurer"
+    else:
+        return "💰 Preisänderung", 0xF1C40F, None
+
+    detail = f"CHF {abs(difference):.2f} {direction} ({percent:.1f} %)"
+    return label, color, detail
+
+
+def _rich_product_embed(change: ProductChange) -> dict[str, Any]:
     product = change.product
-    title = " ".join(product.title.split())
-    if len(title) > 140:
-        title = title[:137] + "…"
+    label, color = LABELS.get(change.kind, ("Produktänderung", 0x95A5A6))
+    price_difference_text: str | None = None
+
+    if change.kind == "price_change":
+        label, color, price_difference_text = _price_change_details(change)
+
+    # Ereignisfarben bleiben eindeutig. Nur ein widersprüchlicher Restock-Test
+    # mit "nicht verfügbar" wird rot dargestellt.
+    if change.kind == "new_product":
+        color = 0x3498DB
+    elif change.kind == "new_preorder":
+        color = 0x9B59B6
+    elif change.kind == "restock":
+        color = 0x2ECC71 if product.status == "available" else 0xE74C3C
+
+    fields: list[dict[str, Any]] = [
+        {
+            "name": "🏪 Shop",
+            "value": _safe_value(product.shop),
+            "inline": True,
+        },
+        {
+            "name": "📦 Status",
+            "value": (
+                "🟣 Vorbestellbar"
+                if change.kind == "new_preorder" and product.status == "available"
+                else STATUS_LABELS.get(product.status, _safe_value(product.status))
+            ),
+            "inline": True,
+        },
+    ]
+
+    if product.price:
+        fields.append(
+            {
+                "name": "💰 Preis",
+                "value": f"**{_safe_value(product.price)}**",
+                "inline": True,
+            }
+        )
+
+    if change.kind == "price_change" and change.old_price:
+        fields.append(
+            {
+                "name": "↩️ Vorher",
+                "value": _safe_value(change.old_price),
+                "inline": True,
+            }
+        )
+
+    if price_difference_text:
+        fields.append(
+            {
+                "name": "📊 Unterschied",
+                "value": price_difference_text,
+                "inline": False,
+            }
+        )
+
+    embed: dict[str, Any] = {
+        "title": f"{label}: {_clean_title(product.title, max_length=210)}",
+        "url": product.url,
+        "color": color,
+        "description": f"[🛒 **Direkt zum Produkt**]({product.url})",
+        "fields": fields,
+        "footer": {"text": "⚡ Pokémon Radar • Schweiz"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    if product.image_url:
+        embed["image"] = {"url": product.image_url}
+
+    return embed
+
+
+def _compact_product_line(change: ProductChange) -> str:
+    product = change.product
+    title = _clean_title(product.title, max_length=140)
 
     details: list[str] = []
     if product.price:
@@ -113,7 +247,7 @@ def _product_line(change: ProductChange) -> str:
     if change.kind == "price_change" and change.old_price:
         details.append(f"vorher {change.old_price}")
     if product.status:
-        details.append(product.status)
+        details.append(STATUS_LABELS.get(product.status, product.status))
 
     suffix = f" — {' | '.join(details)}" if details else ""
     return f"• [{title}]({product.url}){suffix}"
@@ -139,20 +273,9 @@ def _chunk_lines(lines: list[str], *, max_chars: int = 3500) -> list[str]:
     return chunks
 
 
-def send_product_changes(shop_name: str, changes: Iterable[ProductChange]) -> int:
-    """Sendet Änderungen eines Shops als wenige kompakte Sammelmeldungen.
-
-    Rückgabewert: Anzahl gesendeter Discord-Webhook-Nachrichten.
-    """
-    grouped: dict[str, list[ProductChange]] = defaultdict(list)
-    total = 0
-    for change in changes:
-        grouped[change.kind].append(change)
-        total += 1
-
-    if total == 0:
-        return 0
-
+def _compact_group_embeds(
+    grouped: dict[str, list[ProductChange]],
+) -> list[dict[str, Any]]:
     embeds: list[dict[str, Any]] = []
     order = ("new_product", "new_preorder", "restock", "price_change")
 
@@ -162,7 +285,7 @@ def send_product_changes(shop_name: str, changes: Iterable[ProductChange]) -> in
             continue
 
         label, color = LABELS[kind]
-        lines = [_product_line(change) for change in kind_changes]
+        lines = [_compact_product_line(change) for change in kind_changes]
         descriptions = _chunk_lines(lines)
 
         for index, description in enumerate(descriptions, start=1):
@@ -174,21 +297,36 @@ def send_product_changes(shop_name: str, changes: Iterable[ProductChange]) -> in
                     "title": title,
                     "description": description,
                     "color": color,
+                    "footer": {"text": "⚡ Pokémon Radar • Schweiz"},
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
             )
 
-    # Discord erlaubt maximal 10 Embeds und insgesamt höchstens 6000 Zeichen
-    # in allen Embeds einer Webhook-Nachricht. Wir bleiben bewusst darunter.
+    return embeds
+
+
+def _make_batches(
+    embeds: list[dict[str, Any]],
+    *,
+    max_embeds: int,
+    max_embed_chars: int = 5500,
+) -> list[list[dict[str, Any]]]:
     batches: list[list[dict[str, Any]]] = []
     current_batch: list[dict[str, Any]] = []
     current_chars = 0
-    max_embed_chars = 5500
 
     for embed in embeds:
-        embed_chars = len(str(embed.get("title", ""))) + len(str(embed.get("description", "")))
+        embed_chars = (
+            len(str(embed.get("title", "")))
+            + len(str(embed.get("description", "")))
+            + sum(
+                len(str(field.get("name", ""))) + len(str(field.get("value", "")))
+                for field in embed.get("fields", [])
+            )
+        )
 
         if current_batch and (
-            len(current_batch) >= 10
+            len(current_batch) >= max_embeds
             or current_chars + embed_chars > max_embed_chars
         ):
             batches.append(current_batch)
@@ -200,6 +338,30 @@ def send_product_changes(shop_name: str, changes: Iterable[ProductChange]) -> in
 
     if current_batch:
         batches.append(current_batch)
+
+    return batches
+
+
+def send_product_changes(shop_name: str, changes: Iterable[ProductChange]) -> int:
+    """Sendet kleine Mengen mit grossen Bildern, grosse Mengen kompakt."""
+    change_list = list(changes)
+    total = len(change_list)
+    if total == 0:
+        return 0
+
+    grouped: dict[str, list[ProductChange]] = defaultdict(list)
+    for change in change_list:
+        grouped[change.kind].append(change)
+
+    if total <= MAX_RICH_EMBEDS_PER_BATCH:
+        embeds = [_rich_product_embed(change) for change in change_list]
+        batches = _make_batches(
+            embeds,
+            max_embeds=MAX_RICH_EMBEDS_PER_BATCH,
+        )
+    else:
+        embeds = _compact_group_embeds(grouped)
+        batches = _make_batches(embeds, max_embeds=10)
 
     message_count = 0
     for index, embed_batch in enumerate(batches, start=1):
