@@ -9,10 +9,15 @@ from urllib.parse import urlparse
 
 import requests
 
-from config import SCAN_INTERVAL_SECONDS
+from config import (
+    DEFAULT_SHOP_INTERVAL_SECONDS,
+    MAX_WORKERS,
+    SCAN_INTERVAL_SECONDS,
+    SHOP_INTERVALS,
+)
 from database import has_shop_products, init_db, reset_demo_product, save_product
 from models import Product
-from notifier import WebhookError, send_product_change, send_test_message
+from notifier import WebhookError, send_product_change, send_product_changes, send_test_message
 from shops.shopify import parse_shopify_products, scan_shopify
 from shops.wog import SHOP_NAME as WOG_SHOP_NAME
 from shops.wog import scan_wog
@@ -20,6 +25,8 @@ from shops.woocommerce import parse_woocommerce_html, scan_woocommerce
 from shops.prestashop import parse_prestashop_html, scan_prestashop
 from shops_config import PRESTASHOP_SHOPS, SHOPIFY_SHOPS, WOOCOMMERCE_SHOPS
 from shop_detector import detect_shop_type, scanner_name
+from logging_utils import setup_console_logging
+from scheduler import run_shop_scheduler
 
 
 def run_database_demo(send_discord: bool) -> None:
@@ -38,22 +45,41 @@ def run_database_demo(send_discord: bool) -> None:
 
 
 def process_products(shop_name: str, products: list[Product]) -> dict[str, int]:
+    """Speichert zuerst alle Produkte und sendet Änderungen danach gesammelt.
+
+    Dadurch bleiben Datenbank und Shop-Scan zuverlässig, selbst wenn Discord
+    vorübergehend ein Rate-Limit oder einen Netzwerkfehler meldet.
+    """
     initial_scan = not has_shop_products(shop_name)
     if initial_scan:
         print(f"[{shop_name}] Erster Scan: Produkte werden nur gespeichert, ohne Meldungsflut.")
 
     counts = {"available": 0, "unavailable": 0, "unknown": 0}
-    sent = 0
+    changes = []
+
+    # Wichtig: Zuerst den vollständigen Shopzustand in SQLite speichern.
     for product in products:
         counts[product.status] += 1
-        for change in save_product(product, initial_scan=initial_scan):
-            send_product_change(change)
-            sent += 1
-            print(f"[{shop_name}] Meldung gesendet: {change.kind} – {product.title}")
+        changes.extend(save_product(product, initial_scan=initial_scan))
+
+    sent = 0
+    if changes:
+        try:
+            webhook_messages = send_product_changes(shop_name, changes)
+            sent = len(changes)
+            print(
+                f"[{shop_name}] {len(changes)} Produktänderung(en) "
+                f"in {webhook_messages} Discord-Sammelmeldung(en) gesendet."
+            )
+        except WebhookError as error:
+            # Der Shop gilt trotzdem als erfolgreich verarbeitet, weil alle
+            # Produkte bereits vor dem Discord-Versand gespeichert wurden.
+            print(f"[{shop_name}] WARNUNG: Discord-Meldung konnte nicht gesendet werden: {error}")
+            print(f"[{shop_name}] Der Shopzustand wurde trotzdem vollständig gespeichert.")
 
     print(f"[{shop_name}] {len(products)} Pokémon-TCG-Produkte erkannt.")
     print(f"[{shop_name}] Status: {counts['available']} verfügbar, {counts['unavailable']} nicht verfügbar, {counts['unknown']} unbekannt.")
-    print(f"[{shop_name}] Discord-Meldungen in diesem Durchlauf: {sent}")
+    print(f"[{shop_name}] Discord-Produktänderungen in diesem Durchlauf: {sent}")
     return {"products": len(products), "notifications": sent}
 
 
@@ -209,11 +235,17 @@ def run_all_prestashop_once() -> None:
     print(f"\n[PRESTASHOP] Fertig: {succeeded} erfolgreich, {failed} fehlgeschlagen.")
 
 
+def shop_interval_seconds(shop_name: str) -> int:
+    """Liest das gewünschte Scan-Intervall zentral aus config.py."""
+    return int(SHOP_INTERVALS.get(shop_name, DEFAULT_SHOP_INTERVAL_SECONDS))
+
+
 def build_scan_jobs() -> list[dict[str, object]]:
     """Erstellt die Liste aller konfigurierten Shop-Scans."""
     jobs: list[dict[str, object]] = [
         {
             "name": WOG_SHOP_NAME,
+            "interval_seconds": shop_interval_seconds(WOG_SHOP_NAME),
             "scanner": scan_wog,
         }
     ]
@@ -222,6 +254,7 @@ def build_scan_jobs() -> list[dict[str, object]]:
         jobs.append(
             {
                 "name": shop["name"],
+                "interval_seconds": shop_interval_seconds(shop["name"]),
                 "scanner": lambda shop=shop: scan_shopify(shop["name"], shop["url"]),
             }
         )
@@ -230,6 +263,7 @@ def build_scan_jobs() -> list[dict[str, object]]:
         jobs.append(
             {
                 "name": shop["name"],
+                "interval_seconds": shop_interval_seconds(shop["name"]),
                 "scanner": lambda shop=shop: scan_woocommerce(
                     shop["name"],
                     shop["url"],
@@ -242,6 +276,7 @@ def build_scan_jobs() -> list[dict[str, object]]:
         jobs.append(
             {
                 "name": shop["name"],
+                "interval_seconds": shop_interval_seconds(shop["name"]),
                 "scanner": lambda shop=shop: scan_prestashop(
                     shop["name"],
                     shop["url"],
@@ -492,31 +527,19 @@ def timestamp() -> str:
     return datetime.now().strftime("%d.%m.%Y %H:%M:%S")
 
 
-def run_forever(interval_seconds: int, max_workers: int = 5) -> None:
-    interval_seconds = max(60, int(interval_seconds))
-    round_number = 0
-    print(f"[{timestamp()}] [DAUERBETRIEB] Pokémon Radar wurde gestartet.")
-    print(f"[{timestamp()}] [DAUERBETRIEB] Scan-Intervall: {interval_seconds} Sekunden.")
-    print(f"[{timestamp()}] [DAUERBETRIEB] Beenden mit Strg + C.")
-
-    try:
-        while True:
-            round_number += 1
-            started = time.monotonic()
-            print("\n" + "#" * 58)
-            print(f"[{timestamp()}] [RUNDE {round_number}] Scan beginnt.")
-            run_scan_all_once(max_workers)
-            duration = int(time.monotonic() - started)
-            next_start = datetime.now() + timedelta(seconds=interval_seconds)
-            print(f"[{timestamp()}] [RUNDE {round_number}] Dauer: {duration} Sekunden.")
-            print(f"[{timestamp()}] [DAUERBETRIEB] Nächster Scan ungefähr um {next_start.strftime('%H:%M:%S')}.")
-            print("#" * 58)
-            time.sleep(interval_seconds)
-    except KeyboardInterrupt:
-        print(f"\n[{timestamp()}] [DAUERBETRIEB] Sauber beendet. Bis zum nächsten Start!")
+def run_forever(max_workers: int = 5, dashboard: bool = False) -> None:
+    """Startet den dauerhaften Scheduler mit individuellen Shop-Intervallen."""
+    run_shop_scheduler(
+        build_scan_jobs(),
+        process_products,
+        max_workers=max_workers,
+        dashboard=dashboard,
+    )
 
 
 def main() -> int:
+    log_path = setup_console_logging()
+    print(f"[LOG] Ausgabe wird zusätzlich gespeichert in: {log_path}")
     parser = argparse.ArgumentParser(description="Pokémon Radar V2")
     parser.add_argument("--test-webhook", action="store_true")
     parser.add_argument("--test-database", action="store_true")
@@ -532,9 +555,10 @@ def main() -> int:
     parser.add_argument("--scan-all-once", action="store_true")
     parser.add_argument("--detect-shop", metavar="URL", help="Shopsystem einer URL erkennen")
     parser.add_argument("--add-shop", metavar="URL", help="Shop erkennen, testen und nach Bestätigung speichern")
-    parser.add_argument("--workers", type=int, default=5, help="Maximal gleichzeitig geladene Shops (Standard: 5)")
-    parser.add_argument("--run", action="store_true", help="Alle Shops dauerhaft in einem Intervall scannen")
-    parser.add_argument("--interval", type=int, default=SCAN_INTERVAL_SECONDS, help="Wartezeit zwischen Scanrunden in Sekunden (mindestens 60)")
+    parser.add_argument("--workers", type=int, default=MAX_WORKERS, help=f"Maximal gleichzeitig geladene Shops (Standard: {MAX_WORKERS})")
+    parser.add_argument("--run", action="store_true", help="Scheduler mit individuellen Shop-Intervallen starten")
+    parser.add_argument("--dashboard", action="store_true", help="Live-Dashboard im Terminal anzeigen")
+    parser.add_argument("--interval", type=int, default=SCAN_INTERVAL_SECONDS, help="Veraltete Option; der Scheduler nutzt individuelle Shop-Intervalle")
     parser.add_argument("--shop-name", default="Shopify Shop")
     parser.add_argument("--shop-url")
     args = parser.parse_args()
@@ -570,9 +594,7 @@ def main() -> int:
         elif args.scan_all_once:
             run_scan_all_once(args.workers)
         elif args.run:
-            if args.interval < 60:
-                parser.error("Das Intervall muss mindestens 60 Sekunden betragen.")
-            run_forever(args.interval, args.workers)
+            run_forever(args.workers, dashboard=args.dashboard)
         elif args.scan_shopify_once:
             if not args.shop_url:
                 parser.error("Für --scan-shopify-once fehlt --shop-url.")
@@ -583,6 +605,7 @@ def main() -> int:
             print("[INFO] Shop testen:      python app.py --add-shop https://shop.ch")
             print("[INFO] Einmaliger Scan: python app.py --scan-all-once")
             print("[INFO] Dauerbetrieb:    python app.py --run")
+            print("[INFO] Live-Dashboard:  python app.py --run --dashboard")
     except WebhookError as error:
         print(f"[FEHLER] {error}"); return 1
     except requests.exceptions.HTTPError as error:
