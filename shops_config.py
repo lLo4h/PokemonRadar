@@ -18,4 +18,5 @@ PRESTASHOP_SHOPS = [
         "url": "https://www.toytans.ch/de/245-pokemon?resultsPerPage=100",
         "max_pages": 70,
     },
+    {"name": "Pokelu", "url": "https://pokelu.ch/", "max_pages": 70},
 ]
